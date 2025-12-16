@@ -10,6 +10,7 @@ local Players = game:GetService("Players")
 local CollectionService = game:GetService("CollectionService")
 local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
 
 --// players  refs
 local LocalPlayer = Players.LocalPlayer
@@ -28,11 +29,67 @@ local CircleTemplate = script.circle
 -- blobs[player] = { character, { blob, circle, gui,points, name  } }
 local Blobs = {}
 
+-- base walk speed tracking per humanoid
+local BaseWalkSpeeds = setmetatable({}, { __mode = "k" })
+
 -- Utility
 local function resizeOverhead(blob: BasePart, gui: BillboardGui, size: number)
 	local width = (blob.Size.X + blob.Size.Z) / 2
 	gui.Size = UDim2.new(1.25 * width, 0, 0.375 * width)
 	gui.StudsOffset = Vector3.new(0, 0.85 * (size / 2), 0)
+end
+
+-- Detect slope and boost speed when going downhill
+local function applySlopeAcceleration(humanoid: Humanoid, rootPart: BasePart, blob: BasePart, circle: BasePart)
+	if not rootPart then return end
+
+	local moveDir = humanoid.MoveDirection
+	if moveDir.Magnitude < 0.1 then
+		local base = BaseWalkSpeeds[humanoid]
+		if base then
+			humanoid.WalkSpeed = base
+		end
+		return
+	end
+
+	local baseSpeed = BaseWalkSpeeds[humanoid]
+	if not baseSpeed or baseSpeed <= 0 then
+		baseSpeed = humanoid.WalkSpeed
+		if baseSpeed <= 0 then
+			baseSpeed = 16
+		end
+		BaseWalkSpeeds[humanoid] = baseSpeed
+	end
+
+	local offsetDist = 3
+	local rayLength = 20
+	local moveUnit = moveDir.Unit
+	local offset = moveUnit * offsetDist
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { humanoid.Parent, blob, circle }
+
+	local origin = rootPart.Position
+	local down = Vector3.new(0, -rayLength, 0)
+
+	local aheadResult = Workspace:Raycast(origin + offset, down, params)
+	local behindResult = Workspace:Raycast(origin - offset, down, params)
+
+	if not aheadResult or not behindResult then
+		humanoid.WalkSpeed = baseSpeed
+		return
+	end
+
+	local dh = behindResult.Position.Y - aheadResult.Position.Y
+	local slope = dh / (2 * offsetDist)
+
+	if slope > 0.01 then
+		local downhillBoost = math.clamp(slope * 35, 0, 0.8)
+		humanoid.WalkSpeed = baseSpeed * (1 + downhillBoost)
+	else
+		humanoid.WalkSpeed = baseSpeed
+	end
 end
 
 -- Overhead UI
@@ -70,8 +127,7 @@ local function createOverhead(player: Player, blob: BasePart)
 	points.Value = player.Character:GetAttribute("points")
 
 	gui.Parent = player.Character:FindFirstChild("HumanoidRootPart")
-	
-	
+
 	return gui, points, name
 end
 
@@ -169,14 +225,12 @@ RunService.RenderStepped:Connect(function(dt)
 
 		local size = Components:require("shared_functions"):get_size(character:GetAttribute("points"))
 
-		-- Hide real character
 		for _, part in ipairs(character:GetDescendants()) do
 			if part:IsA("BasePart") and part.Name ~= "blob" then
 				part.Transparency = 1
 			end
 		end
 
-		-- Ensure blob exists
 		if not Blobs[player] and humanoid.Health > 0 then
 			createBlob(player, character, size)
 		end
@@ -194,12 +248,10 @@ RunService.RenderStepped:Connect(function(dt)
 			continue
 		end
 
-		-- Camera follows humanoid
 		if player == LocalPlayer then
 			Camera.CameraSubject = humanoid
 		end
 
-		-- Breathing animation
 		local runTime = tick()
 		local breathe = humanoid.MoveDirection.Magnitude > 0.1
 			and math.sin(runTime * 10) * (size / 60) - (size / 30)
@@ -210,8 +262,11 @@ RunService.RenderStepped:Connect(function(dt)
 			0.1
 		)
 
-		blob.Position = humanoid.RootPart.Position + Vector3.new(0, -3 + blob.Size.Y / 2, 0)
-		circle.Position = humanoid.RootPart.Position + Vector3.new(0, -3, 0)
+		local rootPart = humanoid.RootPart
+		if rootPart then
+			blob.Position = rootPart.Position + Vector3.new(0, -3 + blob.Size.Y / 2, 0)
+			circle.Position = rootPart.Position + Vector3.new(0, -3, 0)
+		end
 
 		if humanoid.MoveDirection.Magnitude > 0.2 then
 			blob.CFrame = blob.CFrame:Lerp(
@@ -220,10 +275,14 @@ RunService.RenderStepped:Connect(function(dt)
 			)
 		end
 
+		-- slope-based acceleration (mainly affects local player's humanoid)
+		if player == LocalPlayer and rootPart then
+			applySlopeAcceleration(humanoid, rootPart, blob, circle)
+		end
+
 		resizeOverhead(blob, gui, size)
 		points.Value = character:GetAttribute("points")
 	end
 end)
 
--- Cleanup
 Players.PlayerRemoving:Connect(destroyBlob)
